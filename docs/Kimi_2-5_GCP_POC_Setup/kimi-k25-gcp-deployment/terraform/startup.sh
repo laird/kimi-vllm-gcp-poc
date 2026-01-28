@@ -117,50 +117,75 @@ services:
 EOF
 
 # =============================================================================
-# Create Systemd Service for Docker Compose
+# Install NVIDIA Drivers for COS
 # =============================================================================
-log "Creating systemd service..."
-
-cat > /etc/systemd/system/kimi-vllm.service << 'EOF'
-[Unit]
-Description=Kimi K2.5 vLLM Inference Server
-Requires=docker.service
-After=docker.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=/var/lib/docker-compose
-ExecStart=/usr/bin/docker compose up -d
-ExecStop=/usr/bin/docker compose down
-TimeoutStartSec=600
-
-[Install]
-WantedBy=multi-user.target
-EOF
+log "Installing NVIDIA drivers..."
+# Standard COS method for A100/H100
+docker run --rm --privileged gcr.io/cos-cloud/cos-gpu-installer:latest install
 
 # =============================================================================
 # Configure NVIDIA Container Runtime
 # =============================================================================
 log "Configuring NVIDIA Container Runtime..."
 
-# Ensure nvidia-container-toolkit is configured
-if [ -f /etc/docker/daemon.json ]; then
-    # Backup existing config
-    cp /etc/docker/daemon.json /etc/docker/daemon.json.backup
-fi
-
-# Set up default runtime
+mkdir -p /etc/docker
 cat > /etc/docker/daemon.json << 'EOF'
 {
+    "default-runtime": "nvidia",
     "runtimes": {
         "nvidia": {
             "path": "nvidia-container-runtime",
             "runtimeArgs": []
         }
-    },
-    "default-runtime": "nvidia"
+    }
 }
+EOF
+
+# Restart Docker to apply changes
+log "Restarting Docker..."
+systemctl restart docker
+
+# =============================================================================
+# Create Systemd Service (Docker Run)
+# =============================================================================
+log "Creating systemd service..."
+
+cat > /etc/systemd/system/kimi-vllm.service << EOF
+[Unit]
+Description=Kimi K2.5 vLLM Inference Server
+Requires=docker.service
+After=docker.service
+
+[Service]
+Restart=always
+ExecStartPre=-/usr/bin/docker stop kimi-k25-server
+ExecStartPre=-/usr/bin/docker rm kimi-k25-server
+ExecStart=/usr/bin/docker run \\
+    --name kimi-k25-server \\
+    --runtime=nvidia \\
+    -p ${api_port}:${api_port} \\
+    -v /mnt/disks/model-storage:/root/.cache/huggingface \\
+    -v /mnt/disks/model-storage:/models \\
+    -e NVIDIA_VISIBLE_DEVICES=all \\
+    -e HUGGING_FACE_HUB_TOKEN=${huggingface_token} \\
+    vllm/vllm-openai:v0.11.0 \\
+    python -m vllm.entrypoints.openai.api_server \\
+    --model=${model_path} \\
+    --tensor-parallel-size=${tensor_parallel} \\
+    --trust-remote-code \\
+    --max-model-len=32768 \\
+    --dtype=bfloat16 \\
+    --tool-call-parser=kimi_k2 \\
+    --reasoning-parser=kimi_k2 \\
+    --port=${api_port} \\
+    --download-dir=/models \\
+    --load-format=auto \\
+    --quantization=None
+
+ExecStop=/usr/bin/docker stop kimi-k25-server
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
 # =============================================================================
